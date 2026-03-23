@@ -1,0 +1,15 @@
+dist
+build
+*.eggs/*
+*.egg-info
+*.py[cod]
+
+pdoc/_version.py
+
+venv
+.venv
+htmlcov
+.coverage
+.*_cache/*
+
+html/*

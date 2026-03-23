@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  pdoc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./doc:/app/doc:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  pdoc-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["--html", "--output-dir", "/output", "pdoc"]
+    volumes:
+      - ./doc/build:/output
+    profiles:
+      - build
+
+  pdoc-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./pdoc:/app/pdoc:ro
+      - ./doc:/app/doc:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    profiles:
+      - dev
+
+networks:
+  default:
+    name: pdoc-network

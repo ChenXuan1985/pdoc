@@ -1,0 +1,235 @@
+name: Monitoring & Alerts
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # 每15分钟检查一次
+  workflow_dispatch:
+    inputs:
+      check_type:
+        description: '检查类型'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - health
+          - links
+          - performance
+
+env:
+  WEBSITE_URL: https://pdoc3.github.io/pdoc
+  STAGING_URL: https://pdoc3.github.io/pdoc/staging
+
+jobs:
+  # ============================================
+  # 健康检查
+  # ============================================
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-latest
+    if: github.event.inputs.check_type == 'all' || github.event.inputs.check_type == 'health'
+    steps:
+      - name: Check Production Health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL")
+          if [ "$response" != "200" ]; then
+            echo "::error::Production health check failed! Status: $response"
+            exit 1
+          fi
+          echo "Production is healthy (HTTP $response)"
+
+      - name: Check Staging Health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL")
+          if [ "$response" != "200" ]; then
+            echo "::warning::Staging health check failed! Status: $response"
+          else
+            echo "Staging is healthy (HTTP $response)"
+          fi
+
+      - name: Check Response Time
+        run: |
+          echo "Checking response times..."
+          production_time=$(curl -s -o /dev/null -w "%{time_total}" "$WEBSITE_URL")
+          staging_time=$(curl -s -o /dev/null -w "%{time_total}" "$STAGING_URL")
+          
+          echo "Production response time: ${production_time}s"
+          echo "Staging response time: ${staging_time}s"
+          
+          # 如果响应时间超过 5 秒，发出警告
+          if (( $(echo "$production_time > 5" | bc -l) )); then
+            echo "::warning::Production response time is slow: ${production_time}s"
+          fi
+
+  # ============================================
+  # 链接检查
+  # ============================================
+  link-check:
+    name: Broken Link Check
+    runs-on: ubuntu-latest
+    if: github.event.inputs.check_type == 'all' || github.event.inputs.check_type == 'links'
+    steps:
+      - name: Install linkchecker
+        run: pip install linkchecker
+
+      - name: Check Production Links
+        run: |
+          linkchecker "$WEBSITE_URL" \
+            --check-extern \
+            --timeout=30 \
+            --threads=5 \
+            --output=html/utf8 > linkcheck-report.html 2>&1 || true
+
+      - name: Upload Link Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkcheck-report
+          path: linkcheck-report.html
+          retention-days: 7
+
+      - name: Parse Link Check Results
+        run: |
+          if grep -q "Error" linkcheck-report.html; then
+            errors=$(grep -c "Error" linkcheck-report.html)
+            echo "::warning::Found $errors broken links"
+          else
+            echo "No broken links found"
+          fi
+
+  # ============================================
+  # 性能监控
+  # ============================================
+  performance-check:
+    name: Performance Check
+    runs-on: ubuntu-latest
+    if: github.event.inputs.check_type == 'all' || github.event.inputs.check_type == 'performance'
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli
+
+      - name: Run Lighthouse CI
+        run: |
+          lhci autorun --config=lighthouserc.js || true
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+      - name: Upload Lighthouse Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-results
+          path: |
+            .lighthouseci/
+            lhci-reports/
+          retention-days: 30
+
+  # ============================================
+  # SSL 证书监控
+  # ============================================
+  ssl-check:
+    name: SSL Certificate Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check SSL Certificate Expiry
+        run: |
+          expiry_date=$(echo | openssl s_client -servername pdoc3.github.io -connect pdoc3.github.io:443 2>/dev/null | openssl x509 -noout -dates | grep notAfter | cut -d= -f2)
+          expiry_timestamp=$(date -d "$expiry_date" +%s)
+          current_timestamp=$(date +%s)
+          days_until_expiry=$(( (expiry_timestamp - current_timestamp) / 86400 ))
+          
+          echo "SSL Certificate expires in $days_until_expiry days"
+          
+          if [ $days_until_expiry -lt 30 ]; then
+            echo "::warning::SSL Certificate expires in $days_until_expiry days!"
+          fi
+
+  # ============================================
+  # 告警通知
+  # ============================================
+  notify:
+    name: Send Alerts
+    runs-on: ubuntu-latest
+    needs: [health-check, link-check, performance-check, ssl-check]
+    if: always() && (failure() || cancelled())
+    steps:
+      - name: Create Alert Message
+        id: alert
+        run: |
+          message="🚨 pdoc Documentation Alert\n\n"
+          message+="Failed Jobs:\n"
+          
+          if [ "${{ needs.health-check.result }}" == "failure" ]; then
+            message+="- ❌ Health Check\n"
+          fi
+          if [ "${{ needs.link-check.result }}" == "failure" ]; then
+            message+="- ❌ Link Check\n"
+          fi
+          if [ "${{ needs.performance-check.result }}" == "failure" ]; then
+            message+="- ❌ Performance Check\n"
+          fi
+          if [ "${{ needs.ssl-check.result }}" == "failure" ]; then
+            message+="- ❌ SSL Check\n"
+          fi
+          
+          message+="\nTime: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)\n"
+          message+="Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$message" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # GitHub Issues 告警
+      - name: Create GitHub Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Monitoring Alert: ${new Date().toISOString()}`;
+            const body = `${{ steps.alert.outputs.message }}`;
+            
+            // 检查是否已有未关闭的告警 issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'alert',
+              state: 'open'
+            });
+            
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['alert', 'monitoring']
+              });
+            }
+
+      # Slack 告警 (需要配置 SLACK_WEBHOOK_URL)
+      - name: Notify Slack
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.alert.outputs.message }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      # Email 告警 (需要配置邮件服务)
+      - name: Send Email Alert
+        if: secrets.SMTP_SERVER != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "pdoc Documentation Alert"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: ${{ secrets.SMTP_FROM }}
+          body: ${{ steps.alert.outputs.message }}

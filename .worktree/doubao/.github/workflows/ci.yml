@@ -1,0 +1,302 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '**.rst'
+  pull_request:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '**.rst'
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly on Sunday at 2AM UTC
+  workflow_dispatch:
+    inputs:
+      run_lint:
+        description: 'Run linting checks'
+        required: true
+        default: 'true'
+        type: boolean
+      run_tests:
+        description: 'Run test suite'
+        required: true
+        default: 'true'
+        type: boolean
+      run_coverage:
+        description: 'Run coverage report'
+        required: true
+        default: 'true'
+        type: boolean
+
+env:
+  PYTHON_VERSIONS: '["3.9", "3.10", "3.11"]'
+  DEFAULT_PYTHON: '3.11'
+
+jobs:
+  lint:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_lint || github.event_name != 'workflow_dispatch' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.DEFAULT_PYTHON }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.DEFAULT_PYTHON }}
+          cache: 'pip'
+          cache-dependency-path: |
+            setup.py
+            setup.cfg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[dev] || pip install -e .
+          pip install flake8 mypy types-Markdown markdownlint-cli
+
+      - name: Lint Python code with flake8
+        run: |
+          echo "Running flake8..."
+          flake8 pdoc setup.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 pdoc setup.py --count --exit-zero --max-complexity=10 --statistics
+
+      - name: Type checking with mypy
+        run: |
+          echo "Running mypy type checking..."
+          mypy -p pdoc --show-error-codes
+
+      - name: Check Markdown files
+        run: |
+          echo "Checking Markdown files..."
+          find . -name '*.md' -not -path './.git/*' -not -path '*/test/*' | xargs markdownlint || true
+
+  test:
+    name: Test on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: lint
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' && inputs.run_tests || github.event_name != 'workflow_dispatch') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+        os: [ubuntu-latest]
+        include:
+          - os: windows-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.11'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }} on ${{ matrix.os }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+
+      - name: Run test suite
+        run: |
+          echo "Running tests on Python ${{ matrix.python-version }} (${{ matrix.os }})..."
+          python -m unittest discover -v -s pdoc/test
+
+      - name: Run doctests
+        run: |
+          echo "Running doctests..."
+          python -m doctest README.md -v || true
+
+  coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' && inputs.run_coverage || github.event_name != 'workflow_dispatch') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.DEFAULT_PYTHON }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.DEFAULT_PYTHON }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+          pip install coverage codecov
+
+      - name: Generate coverage report
+        run: |
+          echo "Running coverage..."
+          coverage run -m unittest discover -s pdoc/test
+          coverage report -m
+          coverage xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  pdf-test:
+    name: PDF Generation Test
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ always() }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache pandoc and TeX Live
+        id: cache-pandoc
+        uses: actions/cache@v3
+        with:
+          path: |
+            /tmp/pandoc.deb
+            /var/cache/apt/archives/texlive*.deb
+          key: ${{ runner.os }}-pandoc-texlive
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+
+      - name: Install TeX Live and Pandoc
+        run: |
+          echo "Installing TeX Live (for PDF generation)..."
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends texlive-xetex lmodern texlive-fonts-recommended
+          
+          echo "Installing Pandoc..."
+          if [ ! -f /tmp/pandoc.deb ]; then
+            wget --no-clobber -O /tmp/pandoc.deb https://github.com/jgm/pandoc/releases/download/3.1.12.2/pandoc-3.1.12.2-1-amd64.deb
+          fi
+          sudo dpkg -i /tmp/pandoc.deb
+
+      - name: Test PDF generation
+        run: |
+          echo "Testing PDF generation..."
+          PDOC_TEST_PANDOC=1 python -m unittest -v pdoc.test.CliTest.test_pdf_pandoc
+
+      - name: Upload generated PDF as artifact
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Pdoc-Documentation.pdf
+          path: /tmp/pdoc.pdf
+          retention-days: 30
+
+  build-docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: ${{ always() && github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+
+      - name: Build documentation
+        run: |
+          echo "Building documentation..."
+          mkdir -p docs_build
+          pdoc --html --output-dir docs_build pdoc
+          
+          # Create index redirect
+          if [ -d "docs_build/pdoc" ]; then
+            mv docs_build/pdoc/* docs_build/
+            rmdir docs_build/pdoc
+          fi
+          
+          cat > docs_build/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta http-equiv="refresh" content="0; url=pdoc.html" />
+              <title>pdoc Documentation</title>
+          </head>
+          <body>
+              Redirecting to <a href="pdoc.html">documentation</a>...
+          </body>
+          </html>
+          EOF
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: docs_build/
+          retention-days: 7
+
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [lint, test, coverage, pdf-test, build-docs]
+    if: ${{ always() }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate pipeline summary
+        run: |
+          echo "## CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- Lint: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Test: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- PDF Test: ${{ needs.pdf-test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Docs: ${{ needs.build-docs.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            echo "❌ Some jobs failed. Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All jobs completed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi

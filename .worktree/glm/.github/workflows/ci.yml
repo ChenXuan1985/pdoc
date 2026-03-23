@@ -1,0 +1,394 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+  schedule:
+    - cron: '12 2 6 * *'
+  workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests including slow ones'
+        required: false
+        default: 'false'
+        type: boolean
+      target_branch:
+        description: 'Target branch to test'
+        required: false
+        default: ''
+        type: string
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PIP_NO_WARN_SCRIPT_LOCATION: '1'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code }}
+      docs_changed: ${{ steps.filter.outputs.docs }}
+      ci_changed: ${{ steps.filter.outputs.ci }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect file changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'pdoc/**/*.py'
+              - 'setup.py'
+              - 'setup.cfg'
+              - 'pyproject.toml'
+              - 'requirements*.txt'
+            docs:
+              - 'doc/**'
+              - 'README.md'
+              - 'CHANGELOG'
+            ci:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code_changed == 'true' || needs.detect-changes.outputs.ci_changed == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            setup.py
+            setup.cfg
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-lint-${{ hashFiles('setup.py', 'setup.cfg') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-lint-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install -e .
+          pip install flake8 mypy types-Markdown
+
+      - name: Run flake8
+        run: flake8 pdoc setup.py
+
+      - name: Run mypy
+        run: mypy -p pdoc
+
+      - name: Lint markdown files
+        run: find . -name '*.md' | xargs .github/lint-markdown.sh
+
+  test:
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [detect-changes, lint]
+    if: always() && needs.lint.result != 'failure' && (needs.detect-changes.outputs.code_changed == 'true' || needs.detect-changes.outputs.ci_changed == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+        os: [ubuntu-latest]
+        include:
+          - python-version: '3.11'
+            os: macos-latest
+          - python-version: '3.11'
+            os: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            setup.py
+            setup.cfg
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~\AppData\Local\pip\Cache
+            ~/Library/Caches/pip
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('setup.py', 'setup.cfg') }}
+          restore-keys: |
+            ${{ runner.os }}-py${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install -e .
+
+      - name: Run tests
+        run: python -m unittest -v pdoc.test
+
+      - name: Upload test results
+        if: always() && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}-${{ matrix.os }}
+          path: |
+            .coverage
+            coverage.xml
+          retention-days: 7
+
+  coverage:
+    name: Coverage Report
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint]
+    if: always() && needs.lint.result != 'failure' && (needs.detect-changes.outputs.code_changed == 'true' || needs.detect-changes.outputs.ci_changed == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache pip and pandoc
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            /tmp/pandoc.deb
+          key: ${{ runner.os }}-coverage-${{ hashFiles('setup.py', 'setup.cfg') }}
+          restore-keys: |
+            ${{ runner.os }}-coverage-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install -e .
+          pip install coverage mypy types-Markdown
+
+      - name: Install system dependencies for PDF tests
+        run: |
+          sudo apt-get remove -y man-db || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex lmodern texlive-fonts-recommended
+
+      - name: Download pandoc
+        run: |
+          wget --no-clobber -O/tmp/pandoc.deb \
+            https://github.com/jgm/pandoc/releases/download/3.1.12.2/pandoc-3.1.12.2-1-amd64.deb || true
+          sudo dpkg -i /tmp/pandoc.deb
+
+      - name: Run tests with coverage
+        run: coverage run -m unittest -v pdoc.test
+
+      - name: Generate coverage report
+        run: |
+          coverage report
+          coverage xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          flags: unittests
+          name: pdoc-coverage
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Run PDF test
+        env:
+          PDOC_TEST_PANDOC: '1'
+        run: python -m unittest -v pdoc.test.CliTest.test_pdf_pandoc
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pdoc-Documentation-PDF
+          path: /tmp/pdoc.pdf
+          retention-days: 30
+
+  build-docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: [detect-changes, test]
+    if: always() && needs.test.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --depth=1 origin +refs/tags/*:refs/tags/*
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          pip install -e .
+
+      - name: Build documentation
+        run: time doc/build.sh
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: doc/build/
+          retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code_changed == 'true' || github.event_name == 'schedule'
+    outputs:
+      vulnerabilities_found: ${{ steps.scan.outputs.vulnerabilities_found }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install bandit safety
+
+      - name: Run Bandit security scan
+        id: scan
+        run: |
+          bandit -r pdoc -ll -f json -o bandit-report.json || true
+          safety check --json --output safety-report.json || true
+          
+          VULN_COUNT=$(jq '[.results[]] | length' bandit-report.json 2>/dev/null || echo "0")
+          echo "vulnerabilities_found=$VULN_COUNT" >> $GITHUB_OUTPUT
+          
+          if [[ "$VULN_COUNT" -gt 0 ]]; then
+            echo "::warning::Found $VULN_COUNT potential security issues"
+          fi
+
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 30
+
+      - name: Security alert notification
+        if: steps.scan.outputs.vulnerabilities_found != '0'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          chmod +x .github/notify.sh
+          .github/notify.sh \
+            -t security \
+            -s warning \
+            -m "Found ${{ steps.scan.outputs.vulnerabilities_found }} potential security issues"
+
+  ci-status:
+    name: CI Status Check
+    runs-on: ubuntu-latest
+    needs: [lint, test, coverage, build-docs, security-scan]
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine CI status
+        id: status
+        run: |
+          if [[ "${{ needs.lint.result }}" == "failure" ]] || \
+             [[ "${{ needs.test.result }}" == "failure" ]] || \
+             [[ "${{ needs.coverage.result }}" == "failure" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=CI pipeline failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=CI pipeline passed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send CI notification
+        if: github.event_name != 'pull_request'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          chmod +x .github/notify.sh
+          .github/notify.sh \
+            -t ci \
+            -s ${{ steps.status.outputs.status }} \
+            -m "${{ steps.status.outputs.message }}"
+
+      - name: Fail if CI failed
+        if: steps.status.outputs.status == 'failure'
+        run: |
+          echo "❌ CI failed!"
+          exit 1
+
+      - name: CI passed
+        if: steps.status.outputs.status == 'success'
+        run: echo "✅ CI passed!"

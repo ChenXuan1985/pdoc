@@ -1,0 +1,375 @@
+name: Documentation Deployment
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version to deploy (for production, uses tag name by default)'
+        required: false
+        type: string
+      force_deploy:
+        description: 'Force deployment even if checks fail'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DEFAULT_PYTHON: '3.11'
+  GH_PAGES_BRANCH: 'gh-pages'
+
+jobs:
+  pre-deploy-check:
+    name: Pre-Deployment Checks
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      version: ${{ steps.set-env.outputs.version }}
+      deploy_enabled: ${{ steps.set-env.outputs.deploy_enabled }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine deployment environment and version
+        id: set-env
+        run: |
+          # Determine environment
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ENV="production"
+          else
+            ENV="staging"
+          fi
+          
+          # Determine version
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD)"
+          fi
+          
+          # Check if deployment should proceed
+          DEPLOY_ENABLED="true"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${ENV}" = "staging" ]; then
+            # For staging, always deploy on master/main push
+            DEPLOY_ENABLED="true"
+          fi
+          
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "deploy_enabled=${DEPLOY_ENABLED}" >> $GITHUB_OUTPUT
+          
+          echo "Deployment Environment: ${ENV}"
+          echo "Version: ${VERSION}"
+          echo "Deploy Enabled: ${DEPLOY_ENABLED}"
+
+  build-for-deployment:
+    name: Build Documentation for Deployment
+    runs-on: ubuntu-latest
+    needs: pre-deploy-check
+    if: ${{ needs.pre-deploy-check.outputs.deploy_enabled == 'true' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.DEFAULT_PYTHON }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+
+      - name: Build documentation
+        run: |
+          echo "Building documentation for ${{ needs.pre-deploy-check.outputs.environment }} environment..."
+          mkdir -p deploy_docs
+          
+          # Build main documentation
+          pdoc --html --output-dir deploy_docs pdoc
+          
+          # Clean up and organize
+          if [ -d "deploy_docs/pdoc" ]; then
+            mv deploy_docs/pdoc/* deploy_docs/
+            rmdir deploy_docs/pdoc
+          fi
+          
+          # Create index redirect
+          cat > deploy_docs/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta http-equiv="refresh" content="0; url=pdoc.html" />
+              <title>pdoc Documentation</title>
+              <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+                .container { max-width: 800px; margin: 50px auto; text-align: center; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>pdoc Documentation</h1>
+                  <p>Redirecting to <a href="pdoc.html">pdoc documentation</a>...</p>
+              </div>
+          </body>
+          </html>
+          EOF
+          
+          # Create environment marker
+          echo "${{ needs.pre-deploy-check.outputs.environment }}" > deploy_docs/DEPLOY_ENV
+          echo "${{ needs.pre-deploy-check.outputs.version }}" > deploy_docs/VERSION
+          echo "$(date -u +"%Y-%m-%d %H:%M:%S UTC")" > deploy_docs/BUILD_TIME
+          
+          # Create versions.json for version navigation
+          cat > deploy_docs/versions.json <<EOF
+          [
+            {
+              "name": "${{ needs.pre-deploy-check.outputs.version }}",
+              "environment": "${{ needs.pre-deploy-check.outputs.environment }}",
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            }
+          ]
+          EOF
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployable-documentation
+          path: deploy_docs/
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-check, build-for-deployment]
+    if: ${{ needs.pre-deploy-check.outputs.environment == 'staging' }}
+    environment:
+      name: staging
+      url: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/staging
+    
+    permissions:
+      contents: write
+      pages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download documentation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployable-documentation
+          path: deploy_docs
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Deploy to GitHub Pages (staging)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy_docs
+          destination_dir: staging
+          keep_files: true
+          publish_branch: ${{ env.GH_PAGES_BRANCH }}
+          commit_message: "Deploy staging documentation: ${{ needs.pre-deploy-check.outputs.version }}"
+
+      - name: Verify deployment
+        run: |
+          echo "Staging deployment completed!"
+          echo "Staging URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/staging"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-check, build-for-deployment]
+    if: ${{ needs.pre-deploy-check.outputs.environment == 'production' }}
+    environment:
+      name: production
+      url: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+    
+    permissions:
+      contents: write
+      pages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download documentation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployable-documentation
+          path: deploy_docs
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Deploy to GitHub Pages (production root)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy_docs
+          destination_dir: ./
+          keep_files: true
+          publish_branch: ${{ env.GH_PAGES_BRANCH }}
+          commit_message: "Deploy production documentation: ${{ needs.pre-deploy-check.outputs.version }}"
+
+      - name: Deploy to GitHub Pages (versioned)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./deploy_docs
+          destination_dir: v/${{ needs.pre-deploy-check.outputs.version }}
+          keep_files: true
+          publish_branch: ${{ env.GH_PAGES_BRANCH }}
+          commit_message: "Deploy versioned documentation: ${{ needs.pre-deploy-check.outputs.version }}"
+
+      - name: Create/Update versions index
+        run: |
+          VERSION="${{ needs.pre-deploy-check.outputs.version }}"
+          
+          # Clone gh-pages branch to update versions.json
+          git clone --depth 1 --branch ${{ env.GH_PAGES_BRANCH }} \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            gh_pages_clone
+          
+          cd gh_pages_clone
+          
+          # Create or update versions.json
+          if [ -f "versions.json" ]; then
+            cat versions.json | python3 -c "
+          import json, sys
+          from datetime import datetime
+          versions = json.load(sys.stdin)
+          new_version = {
+              'name': '${VERSION}',
+              'path': 'v/${VERSION}',
+              'environment': 'production',
+              'timestamp': datetime.utcnow().isoformat() + 'Z'
+          }
+          # Remove duplicates and add new version at the beginning
+          versions = [v for v in versions if v.get('name') != '${VERSION}']
+          versions.insert(0, new_version)
+          # Keep only last 10 versions
+          versions = versions[:10]
+          print(json.dumps(versions, indent=2))
+          " > versions.json.tmp
+            mv versions.json.tmp versions.json
+          else
+            cat > versions.json <<EOF
+          [
+            {
+              "name": "${VERSION}",
+              "path": "v/${VERSION}",
+              "environment": "production",
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            }
+          ]
+          EOF
+          fi
+          
+          # Create version selector HTML
+          cat > version-selector.html.inc <<EOF
+          <div style="position: fixed; top: 10px; right: 10px; z-index: 1000;">
+            <select onchange="window.location.href=this.value" style="padding: 5px 10px; border-radius: 4px;">
+              <option value="#">Version: ${VERSION}</option>
+              <option value="../">Latest (stable)</option>
+          EOF
+          
+          # Add versions to selector
+          cat versions.json | python3 -c "
+          import json
+          with open('versions.json') as f:
+              versions = json.load(f)
+          for v in versions:
+              print(f'              <option value=\\\"../../{v.get('path', '')}\\\">{v.get('name')} ({v.get('environment', 'unknown')})</option>')
+          " >> version-selector.html.inc
+          
+          cat >> version-selector.html.inc <<EOF
+            </select>
+          </div>
+          EOF
+          
+          git add versions.json version-selector.html.inc
+          git commit -m "Update versions index: ${VERSION}" || true
+          git push origin ${{ env.GH_PAGES_BRANCH }} || true
+          
+          cd ..
+          rm -rf gh_pages_clone
+
+      - name: Verify deployment
+        run: |
+          echo "Production deployment completed!"
+          echo "Production URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          echo "Versioned URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/v/${{ needs.pre-deploy-check.outputs.version }}"
+
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [pre-deploy-check, deploy-staging, deploy-production]
+    if: ${{ always() }}
+    
+    steps:
+      - name: Check deployment status
+        run: |
+          ENV="${{ needs.pre-deploy-check.outputs.environment }}"
+          VERSION="${{ needs.pre-deploy-check.outputs.version }}"
+          
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${ENV}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            echo "❌ **Deployment FAILED!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the job logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ **Deployment SUCCESSFUL!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${ENV}" = "production" ]; then
+              echo "Production URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" >> $GITHUB_STEP_SUMMARY
+              echo "Versioned URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/v/${VERSION}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Staging URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/staging" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi

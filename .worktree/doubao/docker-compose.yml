@@ -1,0 +1,95 @@
+# pdoc Docker Compose Configuration
+# Supports static serving, live serving, and multi-environment setups
+
+version: '3.8'
+
+services:
+  # Static documentation serving (production-like)
+  docs-static:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdoc3/pdoc:latest
+    container_name: pdoc-docs-static
+    ports:
+      - "8080:80"
+    networks:
+      - pdoc-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - static
+      - production
+
+  # Live documentation serving (development mode)
+  docs-live:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdoc3/pdoc:live
+    container_name: pdoc-docs-live
+    command: ["/usr/local/bin/start-live.sh"]
+    ports:
+      - "8081:8080"
+    volumes:
+      # Mount your source code here to watch for changes
+      - ./pdoc:/pdoc-source/pdoc:ro
+      # Optionally mount your own project
+      # - ../your-project:/app:ro
+    environment:
+      - PDOC_MODULE=pdoc
+      # - PDOC_MODULE=/app/your_module
+    networks:
+      - pdoc-network
+    restart: unless-stopped
+    profiles:
+      - live
+      - development
+
+  # Staging environment
+  docs-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdoc3/pdoc:staging
+    container_name: pdoc-docs-staging
+    ports:
+      - "8082:80"
+    networks:
+      - pdoc-network
+    restart: unless-stopped
+    profiles:
+      - staging
+
+  # PDF generation service
+  docs-pdf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pdoc3/pdoc:pdf
+    container_name: pdoc-docs-pdf
+    volumes:
+      - ./output:/output
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apt-get update && \
+        apt-get install -y --no-install-recommends texlive-xetex lmodern texlive-fonts-recommended pandoc && \
+        cd /pdoc-source && \
+        PDOC_TEST_PANDOC=1 python -m unittest -v pdoc.test.CliTest.test_pdf_pandoc && \
+        cp /tmp/pdoc.pdf /output/pdoc-documentation.pdf
+    profiles:
+      - pdf
+
+networks:
+  pdoc-network:
+    name: pdoc-network
+    driver: bridge
+
+volumes:
+  pdoc-output:
+    name: pdoc-output

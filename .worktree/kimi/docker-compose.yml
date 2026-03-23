@@ -1,0 +1,92 @@
+# ============================================
+# pdoc Docker Compose 配置
+# 支持开发、测试和生产环境
+# ============================================
+
+version: '3.8'
+
+services:
+  # 开发环境 - 实时重载
+  docs-dev:
+    build:
+      context: .
+      target: development
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./pdoc:/app/pdoc:ro
+      - ./doc:/app/doc:ro
+    environment:
+      - PDOC_DEV_MODE=1
+      - PYTHONUNBUFFERED=1
+    command: ["dev-server"]
+    networks:
+      - pdoc-network
+
+  # 生产环境 - Nginx 服务
+  docs-prod:
+    build:
+      context: .
+      target: production
+    ports:
+      - "80:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - pdoc-network
+
+  # 文档构建服务
+  docs-builder:
+    build:
+      context: .
+      target: builder
+    volumes:
+      - docs-output:/app/doc/build
+    command: ["pdoc3", "--html", "--output-dir", "/app/doc/build", "pdoc"]
+    networks:
+      - pdoc-network
+
+  # 监控服务（可选）
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - pdoc-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - pdoc-network
+    profiles:
+      - monitoring
+
+networks:
+  pdoc-network:
+    driver: bridge
+
+volumes:
+  docs-output:
+  prometheus-data:
+  grafana-data:

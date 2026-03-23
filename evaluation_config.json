@@ -1,0 +1,40 @@
+{
+  "task_id": "2026-03-23_pdoc-devops",
+  "task_name": "pdoc库DevOps自动化部署流程设计",
+  "task_type": "DevOps/工程化",
+  "technology_stack": ["GitHub Actions", "Python", "Docker", "CI/CD"],
+  "complexity": "中等",
+  "models_evaluated": ["doubao", "glm", "kimi"],
+  "evaluator": "AI评测助手",
+  "evaluation_date": "2026-03-23",
+  "scoring_system": {
+    "user_experience": {"weight": 0.25, "max_score": 5},
+    "planning_execution": {"weight": 0.25, "max_score": 5},
+    "understanding_reasoning": {"weight": 0.25, "max_score": 5},
+    "instruction_following": {"weight": 0.25, "max_score": 5}
+  },
+  "evaluation_criteria": {
+    "user_experience": "推理流畅度、输出质量、用户体验",
+    "planning_execution": "任务规划、工具使用、状态追踪",
+    "understanding_reasoning": "代码理解、架构设计、上下文整合",
+    "instruction_following": "多约束条件处理、需求满足度"
+  },
+  "results_summary": {
+    "kimi": {
+      "user_experience": 4.5,
+      "planning_execution": 4.0,
+      "understanding_reasoning": 4.5,
+      "instruction_following": 4.0,
+      "overall_score": 4.25,
+      "status": "completed"
+    },
+    "doubao": {
+      "status": "completed",
+      "notes": "等待详细分析"
+    },
+    "glm": {
+      "status": "in_progress",
+      "notes": "模型仍在处理中"
+    }
+  }
+}
